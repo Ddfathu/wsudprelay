@@ -17,8 +17,8 @@ const CONFIG = Object.freeze({
     IDLE_TIMEOUT_MS: 300000,
     XUDP_GRACE_MS: 60000,
     MAX_CONNECTIONS: 4096,
-    // Defense in depth: UDP/443 must never leave the VPS relay.
-    REJECT_UDP_443: true,
+    // Diubah ke false agar port UDP 443 (QUIC / STUN) tidak ditolak
+    REJECT_UDP_443: false,
 });
 
 const RELAY_MAGIC = Buffer.from('VLRLY004', 'ascii');
@@ -39,8 +39,8 @@ const MAX_MUX_META_LEN = 512;
 const MAX_PACKET_LEN = 65535;
 const utf8Fatal = new TextDecoder('utf-8', { fatal: true });
 
-function rejectUdpTarget(target) {
-    return Boolean(CONFIG.REJECT_UDP_443 && Number(target?.port) === 443);
+function rejectUdpTarget(_target) {
+    return false;
 }
 
 function buildConfig(overrides = {}) {
@@ -445,10 +445,7 @@ class UDPAssociation {
         if (!sink || this.closed) {
             return;
         }
-        Promise.resolve(sink.mux.sendUDPData(sink.id, rinfo, Buffer.from(msg))).catch(() => {
-            // During XUDP migration the old mux can disappear while the UDP socket
-            // intentionally remains alive for the grace window.
-        });
+        Promise.resolve(sink.mux.sendUDPData(sink.id, rinfo, Buffer.from(msg))).catch(() => { });
     }
     close() {
         if (this.closed) {
@@ -523,10 +520,6 @@ class XUDPManager {
 }
 
 async function serveDirectUDP(socket, reader, target) {
-    if (rejectUdpTarget(target)) {
-        await writeControlError(socket, 'UDP/443 rejected');
-        return;
-    }
     const assoc = await UDPAssociation.create();
     let closed = false;
     assoc.attach({
@@ -551,9 +544,6 @@ async function serveDirectUDP(socket, reader, target) {
         for (;;) {
             const payload = await readLengthPayload(reader);
             if (payload.length === 0) {
-                continue;
-            }
-            if (rejectUdpTarget(target)) {
                 continue;
             }
             await assoc.send(target, payload);
@@ -592,9 +582,6 @@ async function servePacketUDP(socket, reader) {
             const target = await readEndpoint(reader);
             const payload = await readLengthPayload(reader);
             if (payload.length === 0) {
-                continue;
-            }
-            if (rejectUdpTarget(target)) {
                 continue;
             }
             await assoc.send(target, payload);
@@ -738,7 +725,7 @@ class MuxConnection {
         throw new Error(`unknown mux status 0x${frame.status.toString(16).padStart(2, '0')}`);
     }
     async handleNew(frame) {
-        if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port || rejectUdpTarget(frame.target)) {
+        if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port) {
             await this.sendEnd(frame.id, true).catch(() => { });
             return;
         }
@@ -790,10 +777,6 @@ class MuxConnection {
         if (frame.network === MUX_NETWORK_UDP && frame.target?.host && frame.target?.port) {
             target = frame.target;
             session.target = target;
-        }
-        if (rejectUdpTarget(target)) {
-            await session.close(true);
-            return;
         }
         await session.sendUDP(target, frame.data).catch(() => session.close(true));
     }
