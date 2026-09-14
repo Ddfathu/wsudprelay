@@ -17,9 +17,27 @@ const CONFIG = Object.freeze({
     IDLE_TIMEOUT_MS: 300000,
     XUDP_GRACE_MS: 60000,
     MAX_CONNECTIONS: 4096,
-    // Diubah ke false agar port UDP 443 (QUIC / STUN) tidak ditolak
+    // Diatur ke false agar port UDP 443 (QUIC/STUN) tidak ditolak
     REJECT_UDP_443: false,
 });
+
+// Real-time Metrics & State Storage untuk Web UI
+const STATS = {
+    startTime: Date.now(),
+    activeClients: 0,
+    totalHandshakes: 0,
+    udpPacketsOut: 0,
+    udpBytesOut: 0,
+    udpPacketsIn: 0,
+    udpBytesIn: 0,
+    recentLogs: [],
+};
+
+function addLog(msg) {
+    const time = new Date().toLocaleTimeString('id-ID');
+    STATS.recentLogs.unshift(`[${time}] ${msg}`);
+    if (STATS.recentLogs.length > 60) STATS.recentLogs.pop();
+}
 
 const RELAY_MAGIC = Buffer.from('VLRLY004', 'ascii');
 const RELAY_MODE_FIXED_UDP = 0x01;
@@ -39,8 +57,8 @@ const MAX_MUX_META_LEN = 512;
 const MAX_PACKET_LEN = 65535;
 const utf8Fatal = new TextDecoder('utf-8', { fatal: true });
 
-function rejectUdpTarget(_target) {
-    return false;
+function rejectUdpTarget(target) {
+    return Boolean(CONFIG.REJECT_UDP_443 && Number(target?.port) === 443);
 }
 
 function buildConfig(overrides = {}) {
@@ -439,13 +457,20 @@ class UDPAssociation {
         await new Promise((resolve, reject) => {
             socket.send(payload, target.port, resolved.address, (err) => err ? reject(err) : resolve());
         });
+        STATS.udpPacketsOut++;
+        STATS.udpBytesOut += payload.length;
     }
     _onMessage(msg, rinfo) {
+        STATS.udpPacketsIn++;
+        STATS.udpBytesIn += msg.length;
         const sink = this.sink;
         if (!sink || this.closed) {
             return;
         }
-        Promise.resolve(sink.mux.sendUDPData(sink.id, rinfo, Buffer.from(msg))).catch(() => { });
+        Promise.resolve(sink.mux.sendUDPData(sink.id, rinfo, Buffer.from(msg))).catch(() => {
+            // During XUDP migration the old mux can disappear while the UDP socket
+            // intentionally remains alive for the grace window.
+        });
     }
     close() {
         if (this.closed) {
@@ -520,6 +545,10 @@ class XUDPManager {
 }
 
 async function serveDirectUDP(socket, reader, target) {
+    if (rejectUdpTarget(target)) {
+        await writeControlError(socket, 'UDP/443 rejected');
+        return;
+    }
     const assoc = await UDPAssociation.create();
     let closed = false;
     assoc.attach({
@@ -544,6 +573,9 @@ async function serveDirectUDP(socket, reader, target) {
         for (;;) {
             const payload = await readLengthPayload(reader);
             if (payload.length === 0) {
+                continue;
+            }
+            if (rejectUdpTarget(target)) {
                 continue;
             }
             await assoc.send(target, payload);
@@ -582,6 +614,9 @@ async function servePacketUDP(socket, reader) {
             const target = await readEndpoint(reader);
             const payload = await readLengthPayload(reader);
             if (payload.length === 0) {
+                continue;
+            }
+            if (rejectUdpTarget(target)) {
                 continue;
             }
             await assoc.send(target, payload);
@@ -725,7 +760,9 @@ class MuxConnection {
         throw new Error(`unknown mux status 0x${frame.status.toString(16).padStart(2, '0')}`);
     }
     async handleNew(frame) {
-        if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port) {
+        // This VPS process is deliberately UDP-only. Mux.Cool TCP substreams must
+        // be terminated by the Cloudflare Worker and must never reach this relay.
+        if (frame.network !== MUX_NETWORK_UDP || !frame.target?.host || !frame.target?.port || rejectUdpTarget(frame.target)) {
             await this.sendEnd(frame.id, true).catch(() => { });
             return;
         }
@@ -777,6 +814,10 @@ class MuxConnection {
         if (frame.network === MUX_NETWORK_UDP && frame.target?.host && frame.target?.port) {
             target = frame.target;
             session.target = target;
+        }
+        if (rejectUdpTarget(target)) {
+            await session.close(true);
+            return;
         }
         await session.sendUDP(target, frame.data).catch(() => session.close(true));
     }
@@ -1141,6 +1182,7 @@ async function handleConnection(socket, cfg, xm) {
     try {
         const control = await readControl(reader);
         established = true;
+        addLog(`[OK] Client Handshake Valid! Mode: 0x${control.mode.toString(16)} Source: ${socket.remoteAddress || 'Worker'}`);
         socket.setTimeout(cfg.idleTimeout > 0 ? cfg.idleTimeout : 0, () => socket.destroy(new Error('idle timeout')));
         if (control.mode === RELAY_MODE_FIXED_UDP) {
             await serveDirectUDP(socket, reader, control.target);
@@ -1155,9 +1197,11 @@ async function handleConnection(socket, cfg, xm) {
     }
     catch (err) {
         if (!established && !socket.destroyed) {
+            addLog(`[WARN] Handshake Gagal: malformed control header`);
             await writeControlError(socket, 'malformed control header');
         }
         else if (!isNormalClose(err)) {
+            addLog(`[ERR] Relay Error: ${err.message || err}`);
             console.error(`relay connection ${socket.remoteAddress || '?'}:${socket.remotePort || '?'}: ${err.message || err}`);
         }
     }
@@ -1178,19 +1222,113 @@ function isNormalClose(err) {
     return msg.includes('unexpected eof') || msg.includes('socket is closed') || msg.includes('idle timeout');
 }
 
+// Dashboard HTML Generator
+function getDashboardHtml() {
+    return `<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Railway UDP Relay Status</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0b0f17; color: #e2e8f0; padding: 18px; }
+        .wrapper { max-width: 820px; margin: 0 auto; }
+        .header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #1e293b; padding-bottom: 14px; margin-bottom: 20px; }
+        .title { font-size: 20px; font-weight: 700; color: #f8fafc; }
+        .subtitle { font-size: 13px; color: #94a3b8; margin-top: 2px; }
+        .badge { background: #15803d; color: #dcfce7; padding: 4px 12px; border-radius: 99px; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-bottom: 22px; }
+        .card { background: #161e2e; border: 1px solid #283548; padding: 16px; border-radius: 8px; }
+        .card-label { font-size: 11px; text-transform: uppercase; color: #94a3b8; font-weight: 600; letter-spacing: 0.5px; margin-bottom: 6px; }
+        .card-val { font-size: 22px; font-weight: 700; color: #38bdf8; }
+        .log-section { background: #161e2e; border: 1px solid #283548; border-radius: 8px; padding: 16px; }
+        .log-header { font-size: 13px; font-weight: 600; color: #94a3b8; margin-bottom: 10px; display: flex; justify-content: space-between; }
+        .log-box { font-family: "JetBrains Mono", Consolas, Menlo, monospace; font-size: 12px; background: #070b12; padding: 12px; border-radius: 6px; height: 280px; overflow-y: auto; color: #a5f3fc; border: 1px solid #1e293b; }
+        .log-item { margin-bottom: 5px; line-height: 1.4; word-break: break-all; }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="header">
+            <div>
+                <div class="title">XUDP WebSocket Relay</div>
+                <div class="subtitle">Railway Live Packet & Session Monitor</div>
+            </div>
+            <span class="badge" id="status-tag">ONLINE</span>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Klien Aktif</div>
+                <div class="card-val" id="active-conns">0</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Total Handshake</div>
+                <div class="card-val" id="total-handshakes">0</div>
+            </div>
+            <div class="card">
+                <div class="card-label">UDP Sent (Out)</div>
+                <div class="card-val" id="udp-out">0 pkt</div>
+            </div>
+            <div class="card">
+                <div class="card-label">UDP Received (In)</div>
+                <div class="card-val" id="udp-in">0 pkt</div>
+            </div>
+        </div>
+
+        <div class="log-section">
+            <div class="log-header">
+                <span>AKTIVITAS PACKET & HANDSHAKE (REAL-TIME)</span>
+                <span style="color:#64748b;">Update: 1s</span>
+            </div>
+            <div class="log-box" id="log-box">
+                <div class="log-item">Menunggu data paket masuk / keluar...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function updateData() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                document.getElementById('active-conns').textContent = data.activeClients;
+                document.getElementById('total-handshakes').textContent = data.totalHandshakes;
+                document.getElementById('udp-out').textContent = data.udpPacketsOut + ' (' + (data.udpBytesOut / 1024).toFixed(1) + ' KB)';
+                document.getElementById('udp-in').textContent = data.udpPacketsIn + ' (' + (data.udpBytesIn / 1024).toFixed(1) + ' KB)';
+                
+                const logBox = document.getElementById('log-box');
+                if (data.recentLogs && data.recentLogs.length > 0) {
+                    logBox.innerHTML = data.recentLogs.map(l => '<div class="log-item">' + l + '</div>').join('');
+                }
+            } catch (err) {
+                document.getElementById('status-tag').textContent = 'OFFLINE';
+                document.getElementById('status-tag').style.background = '#b91c1c';
+            }
+        }
+        setInterval(updateData, 1000);
+        updateData();
+    </script>
+</body>
+</html>`;
+}
+
 function createRelayServer(cfg = buildConfig()) {
     const xm = new XUDPManager(cfg.xudpGrace);
     let active = 0;
-    const requestHandler = (_req, res) => {
-        res.writeHead(426, {
-            'content-type': 'text/plain; charset=utf-8',
-            'connection': 'close',
-            'upgrade': 'websocket',
-        });
-        res.end('WebSocket upgrade required\n');
+    const requestHandler = (req, res) => {
+        if (req.url === '/api/stats') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(STATS));
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(getDashboardHtml());
     };
     const server = http.createServer(requestHandler);
     server.on('upgrade', (req, raw, head) => {
+        STATS.totalHandshakes++;
         if (active >= cfg.maxConns) {
             rejectUpgrade(raw, '503 Service Unavailable', 'server busy');
             return;
@@ -1199,11 +1337,14 @@ function createRelayServer(cfg = buildConfig()) {
         if (!accepted) return;
         const { socket, head: initial } = accepted;
         active++;
+        STATS.activeClients = active;
         let counted = true;
         socket.once('close', () => {
             if (counted) {
                 counted = false;
                 active--;
+                STATS.activeClients = active;
+                addLog(`[DISCONNECT] Client terputus. Sisa klien aktif: ${active}`);
             }
         });
         handleConnection(socket, cfg, xm).catch((err) => {
@@ -1236,6 +1377,7 @@ async function main() {
     const scheme = 'ws';
     const path = cfg.wsPath || '/';
     console.log(`UDP-only/XUDP WebSocket relay listening on ${scheme}://${addr.address}:${addr.port}${path} auth=none xudp-grace=${cfg.xudpGrace}ms`);
+    addLog(`Server relay listening on port ${addr.port}`);
     const shutdown = () => {
         server.close(() => process.exit(0));
         setTimeout(() => process.exit(1), 5000).unref();
